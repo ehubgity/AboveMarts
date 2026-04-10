@@ -2,8 +2,10 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\AccountManager;
+use App\Models\User;
+use Illuminate\Database\Eloquent\Builder;
 use League\Csv\Writer;
-
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -16,44 +18,38 @@ class adminuserController extends Controller
 
     public function index(Request $request)
     {
-        $datausers = DB::table('users')->orderByDesc('id')
-            ->paginate(20);
-
         if (isset($request->lockid)) {
-            DB::table('users')
-                ->where('userId', $request->lockid)
-                ->update(['status' => 'BLOCK']);
+            User::where('userId', $request->lockid)->update(['status' => 'BLOCK']);
             return back();
-
         } elseif (isset($request->unlockid)) {
-            DB::table('users')
-                ->where('userId', $request->unlockid)
-                ->update(['status' => 'ACTIVE']);
+            User::where('userId', $request->unlockid)->update(['status' => 'ACTIVE']);
             return back();
-
         } elseif (isset($request->deleteid)) {
-            DB::table('users')
-                ->where('userId', $request->deleteid)
-                ->delete();
+            User::where('userId', $request->deleteid)->delete();
             return back();
-
         } else {
-            return view('admin.users')->with('datausers', $datausers);
+            $query = trim((string) $request->input('query'));
+            $startsWith = strtoupper(trim((string) $request->input('starts_with')));
+            $startsWith = preg_match('/^[A-Z]$/', $startsWith) ? $startsWith : null;
+            $usersQuery = $this->buildUsersQuery($query, $startsWith);
 
+            $datausers = $usersQuery->paginate(20);
+            $datausers->appends($request->query());
+            $managers = AccountManager::orderBy('name')->get();
+            $assignmentSummary = [
+                'totalUsers' => User::count(),
+                'assignedUsers' => User::whereNotNull('manager')->count(),
+                'unassignedUsers' => User::whereNull('manager')->count(),
+                'filteredUsers' => (clone $usersQuery)->count(),
+            ];
+
+            return view('admin.users', compact('datausers', 'managers', 'query', 'startsWith', 'assignmentSummary'));
         }
-
-
     }
+
     public function search(Request $request)
     {
-        $datausers = DB::table('users')->orderByDesc('id')
-            ->paginate(20);
-
-        $query = $request->input('query');
-
-        $datas = DB::table('users')->where('username', 'LIKE', "%$query%")->orWhere('email', 'LIKE', "%$query%")->orWhere('firstname', 'LIKE', "%$query%")->orWhere('sponsor', 'LIKE', "%$query%")->orWhere('package', 'LIKE', "%$query%")->orWhere('rank', 'LIKE', "%$query%")
-            ->orWhere('phoneNumber', 'LIKE', "%$query%")->orWhere('status', 'LIKE', "%$query%")->orWhere('accountNumber', 'LIKE', "%$query%")->orderByDesc('id')->get();
-        return view('admin.usersearch')->with('query', $query)->with('datas', $datas)->with('datausers', $datausers);
+        return $this->index($request);
     }
     public function exportToCSV(Request $request)
     {
@@ -106,4 +102,29 @@ class adminuserController extends Controller
         }
     }
 
+    private function buildUsersQuery(?string $query, ?string $startsWith = null): Builder
+    {
+        $usersQuery = User::with('accountManager')->orderByDesc('id');
+
+        if ($startsWith !== null) {
+            $usersQuery->where('firstName', 'LIKE', "{$startsWith}%");
+        }
+
+        if ($query !== null && $query !== '') {
+            $usersQuery->where(function (Builder $builder) use ($query) {
+                $builder->where('username', 'LIKE', "%{$query}%")
+                    ->orWhere('email', 'LIKE', "%{$query}%")
+                    ->orWhere('firstName', 'LIKE', "%{$query}%")
+                    ->orWhere('lastName', 'LIKE', "%{$query}%")
+                    ->orWhere('sponsor', 'LIKE', "%{$query}%")
+                    ->orWhere('package', 'LIKE', "%{$query}%")
+                    ->orWhere('rank', 'LIKE', "%{$query}%")
+                    ->orWhere('phoneNumber', 'LIKE', "%{$query}%")
+                    ->orWhere('status', 'LIKE', "%{$query}%")
+                    ->orWhere('accountNumber', 'LIKE', "%{$query}%");
+            });
+        }
+
+        return $usersQuery;
+    }
 }

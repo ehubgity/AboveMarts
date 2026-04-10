@@ -96,7 +96,42 @@
 
         <!-- Switcher js -->
         <script src="{{ asset('assetsa/switcher/js/switcher.js') }}"></script>
-        @include('sweetalert::alert');
+        <script>
+    document.querySelectorAll(".selectAll").forEach(masterCheckbox => {
+        masterCheckbox.addEventListener("change", function() {
+            const table = this.closest("table");
+            const checkboxes = table.querySelectorAll(".user-checkbox");
+            checkboxes.forEach(cb => {
+                cb.checked = this.checked;
+            });
+        });
+    });
+
+    document.querySelectorAll(".select-alphabet").forEach(btn => {
+        btn.addEventListener("click", function() {
+            const letter = this.getAttribute("data-letter").toUpperCase();
+            document.querySelectorAll(".user-checkbox").forEach(cb => {
+                const username = cb.getAttribute("data-username").toUpperCase() || "";
+                if (username.startsWith(letter)) {
+                    cb.checked = true;
+                }
+            });
+        });
+    });
+
+    document.getElementById("bulkAssignForm")?.addEventListener("submit", function(e) {
+        const checkedCount = document.querySelectorAll(".user-checkbox:checked").length;
+        if (checkedCount === 0) {
+            e.preventDefault();
+            Swal.fire({
+                icon: "error",
+                title: "No users selected",
+                text: "Please select at least one user to assign."
+            });
+        }
+    });
+</script>
+@include('sweetalert::alert');
 
     </body>
 

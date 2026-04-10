@@ -173,7 +173,7 @@ Route::middleware(['admin'])->prefix('account-managers')->group(function () {
     Route::get('/managers/{id}/users', [AccountManagerController::class, 'viewUsersOfManager'])->name('managers.users');
 
     Route::get('/assign-users', [AccountManagerController::class, 'assignUsersEqually'])->name('assignUsersEqually');
-    Route::post('/{id}/assign-users', [AccountManagerController::class, 'assignUsers'])->name('assign');
+    Route::post('/assign-users', [AccountManagerController::class, 'assignUsers'])->name('assign');
     Route::get('/reassign-user', [AccountManagerController::class, 'reassign'])->name('reassignindex');
     Route::post('/reassign', [AccountManagerController::class, 'reassignUser'])->name('reassign');
 });

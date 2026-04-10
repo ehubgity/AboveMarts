@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\AccountManager;
 use App\Models\User;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
@@ -85,7 +86,7 @@ class AccountManagerController extends Controller
     {
         $managerToDelete = AccountManager::findOrFail($id);
 
-        // Get users assigned to this manager via direct `users.manager` column
+        // Get users assigned to this manager
         $users = User::where('manager', $managerToDelete->id)->get();
 
         // Get other managers to reassign users
@@ -98,57 +99,127 @@ class AccountManagerController extends Controller
         $managerCount = $otherManagers->count();
         $index = 0;
 
-        foreach ($users as $user) {
-            // Pick a new manager in round-robin style
-            $newManager = $otherManagers[$index % $managerCount];
+        DB::beginTransaction();
+        try {
+            foreach ($users as $user) {
+                // Pick a new manager in round-robin style
+                $newManager = $otherManagers[$index % $managerCount];
 
-            // Decrement old manager
-            $managerToDelete->decrement('noOfUsers');
-            $managerToDelete->decrement('totalUsers');
+                // Assign to new manager
+                $user->manager = $newManager->id;
+                $user->save();
 
-            // Assign to new manager
-            $user->manager = $newManager->id;
-            $user->save();
+                // Optional: Sync pivot if still used anywhere
+                $newManager->assignedUsers()->syncWithoutDetaching([$user->id]);
+                
+                $index++;
+            }
 
-            $newManager->users()->syncWithoutDetaching([$user->id]);
-            $newManager->increment('noOfUsers');
-            $newManager->increment('totalUsers');
+            // Update counts for all managers involved
+            foreach ($otherManagers as $manager) {
+                $count = User::where('manager', $manager->id)->count();
+                $manager->update([
+                    'noOfUsers' => $count,
+                    'totalUsers' => $count
+                ]);
+            }
 
-            $index++;
+            // Detach users from pivot table for the deleted manager
+            $managerToDelete->assignedUsers()->detach();
+            $managerToDelete->delete();
+
+            DB::commit();
+            return redirect()->back()->with('success', 'Manager deleted and users reassigned.');
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return redirect()->back()->with('error', 'Deletion failed: ' . $e->getMessage());
         }
-
-        // Detach users from pivot table (optional cleanup)
-        $managerToDelete->users()->detach();
-
-        // Finally, delete the manager
-        $managerToDelete->delete();
-
-        return redirect()->back()->with('success', 'Manager deleted and users reassigned.');
     }
 
     // 3. Assign to users
     public function assignUsers(Request $request)
     {
         $validated = $request->validate([
-            'usernames' => 'required|array',
+            'manager_email' => 'required|email|exists:account_managers,email',
+            'assignment_mode' => 'required|in:selected,alphabet,search',
+            'usernames' => 'nullable|array',
             'usernames.*' => 'exists:users,username',
-            'manager_email' => 'required|email',
+            'starts_with' => 'nullable|string|size:1|alpha',
+            'query' => 'nullable|string',
+            'only_unassigned' => 'nullable|boolean',
         ]);
 
         $manager = AccountManager::where('email', $validated['manager_email'])->firstOrFail();
+        $usersQuery = User::query();
 
-        // Get user IDs from usernames
-        $userIds = User::whereIn('username', $request->usernames)->pluck('id')->toArray();
+        if ($validated['assignment_mode'] === 'selected') {
+            if (empty($validated['usernames'])) {
+                return redirect()->back()->with('error', 'Select at least one user before assigning a manager.');
+            }
 
-        // Assign users without detaching existing ones
-        $manager->users()->syncWithoutDetaching($userIds);
+            $usersQuery->whereIn('username', $validated['usernames']);
+        }
 
-        return redirect()->back()->with('success', 'Users assigned successfully.');
+        if ($validated['assignment_mode'] === 'alphabet') {
+            if (empty($validated['starts_with'])) {
+                return redirect()->back()->with('error', 'Choose an alphabet before assigning users.');
+            }
+
+            $letter = strtoupper($validated['starts_with']);
+            $usersQuery->where('firstName', 'LIKE', "{$letter}%");
+        }
+
+        if ($validated['assignment_mode'] === 'search') {
+            $searchTerm = trim((string) ($validated['query'] ?? ''));
+            $startsWith = strtoupper(trim((string) ($validated['starts_with'] ?? '')));
+            $hasAlphabetFilter = (bool) preg_match('/^[A-Z]$/', $startsWith);
+
+            if ($searchTerm === '' && !$hasAlphabetFilter) {
+                return redirect()->back()->with('error', 'Apply a search or alphabet filter before assigning the current filtered results.');
+            }
+
+            if ($searchTerm !== '') {
+                $this->applyUserSearchFilter($usersQuery, $searchTerm);
+            }
+
+            if ($hasAlphabetFilter) {
+                $usersQuery->where('firstName', 'LIKE', "{$startsWith}%");
+            }
+        }
+
+        if (($validated['only_unassigned'] ?? false)) {
+            $usersQuery->whereNull('manager');
+        }
+
+        $userIds = (clone $usersQuery)->pluck('id');
+
+        if ($userIds->isEmpty()) {
+            return redirect()->back()->with('error', 'No users matched the selected assignment criteria.');
+        }
+
+        $previousManagerIds = (clone $usersQuery)
+            ->whereNotNull('manager')
+            ->pluck('manager')
+            ->filter()
+            ->unique()
+            ->values()
+            ->all();
+
+        DB::transaction(function () use ($userIds, $manager, $previousManagerIds) {
+            User::whereIn('id', $userIds)->update(['manager' => $manager->id]);
+
+            $this->refreshManagerCounts(array_unique(array_merge($previousManagerIds, [$manager->id])));
+        });
+
+        $userCount = $userIds->count();
+        $label = $userCount === 1 ? 'user' : 'users';
+
+        return redirect()->back()->with('success', "{$userCount} {$label} assigned to {$manager->name} successfully.");
     }
+
     // 4. Reassign to users
     public function reassignUser(Request $request)
     {
-
         $validator = Validator::make($request->all(), [
             'username' => 'required|exists:users,username',
             'manager_email' => 'required|email|exists:account_managers,email',
@@ -156,48 +227,29 @@ class AccountManagerController extends Controller
 
         if ($validator->fails()) {
             return back()
-                ->with('toast_error', $validator->messages()->first())
+                ->with('toast_error', $validator->errors()->first())
                 ->withInput();
         }
 
         $validated = $validator->validated();
         $user = User::where('username', $validated['username'])->firstOrFail();
         $newManager = AccountManager::where('email', $validated['manager_email'])->firstOrFail();
+        $oldManagerId = $user->manager;
 
-        // Handle previous manager count decrement
-        if ($user->manager && $user->manager != $newManager->id) {
-            $previousManager = AccountManager::find($user->manager);
-
-            if ($previousManager) {
-                $previousManager->decrement('noOfUsers');
-                $previousManager->decrement('totalUsers');
-            }
-        }
-
-        // Sync pivot relationship (many-to-many)
-        $user->accountManagers()->syncWithoutDetaching([$newManager->id]);
-
-        // If the new manager is different, increment their counts
-        if ($user->manager !== $newManager->id) {
-            $newManager->increment('noOfUsers');
-            $newManager->increment('totalUsers');
-        }
-
-        // Update the manager reference on the user record
         $user->manager = $newManager->id;
         $user->save();
+        $managerIds = array_filter([$oldManagerId, $newManager->id]);
+        $this->refreshManagerCounts($managerIds);
 
         return redirect()->back()->with('success', 'User reassigned successfully.');
     }
 
-
     public function assignUsersEqually()
     {
-        $managers = AccountManager::all(['id']); // Only fetch what's needed
-        $users = User::whereNull('manager')->get(); // Only unassigned users
+        $managers = AccountManager::all();
+        $users = User::whereNull('manager')->get();
 
         if ($managers->isEmpty() || $users->isEmpty()) {
-
             return redirect()->back()->with('error', 'No managers or unassigned users found.');
         }
 
@@ -205,26 +257,15 @@ class AccountManagerController extends Controller
         $index = 0;
 
         DB::beginTransaction();
-
         try {
             foreach ($users as $user) {
                 $manager = $managers[$index % $managerCount];
-
-                // Update the manager column on the user
                 $user->manager = $manager->id;
                 $user->save();
-
-                $manager->users()->syncWithoutDetaching([$user->id]);
-
                 $index++;
             }
 
-            foreach ($managers as $manager) {
-                $manager->noOfUsers = $manager->users()->count();
-                $manager->totalUsers =  $manager->users()->count();
-                $manager->save();
-            }
-
+            $this->refreshManagerCounts($managers->pluck('id')->all());
 
             DB::commit();
             return redirect()->back()->with('success', 'Users assigned equally to account managers.');
@@ -237,20 +278,74 @@ class AccountManagerController extends Controller
     public function dashboard()
     {
         $manager = auth('account_manager')->user();
-        return view('account_managers.dashboard', compact('manager'));
+
+        if (!$manager instanceof AccountManager) {
+            abort(403);
+        }
+
+        $status = [
+            'total_users' => $manager->users()->count(),
+            'total_deposit' => User::where('manager', $manager->id)->sum('currentBalance'), // Placeholder for actual deposit logic
+            // Add more stats as needed
+        ];
+        return view('account_managers.dashboard', compact('manager', 'status'));
     }
 
     public function assignedUsers()
     {
         $manager = auth('account_manager')->user();
-        $users = $manager->users()->get();
+
+        if (!$manager instanceof AccountManager) {
+            abort(403);
+        }
+
+        $users = $manager->users()->paginate(20);
         return view('account_managers.users', compact('users'));
     }
 
-    public function userTransactions(Request $request)
+    public function userTransactions($id)
     {
-        $user = User::where('userId', $request->id)->first();
-        $transactions = DB::table('transactions')->where('userId', $user->userId)->latest()->get(); // assumes `transactions()` relation exists
+        $user = User::where('userId', $id)->firstOrFail();
+        
+        // Ensure the user belongs to the logged-in manager
+        if ($user->manager !== auth('account_manager')->id()) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $transactions = DB::table('transactions')->where('userId', $user->userId)->latest()->paginate(20);
         return view('account_managers.user_transactions', compact('user', 'transactions'));
+    }
+
+    private function applyUserSearchFilter(Builder $usersQuery, string $searchTerm): void
+    {
+        $usersQuery->where(function (Builder $builder) use ($searchTerm) {
+            $builder->where('username', 'LIKE', "%{$searchTerm}%")
+                ->orWhere('email', 'LIKE', "%{$searchTerm}%")
+                ->orWhere('firstName', 'LIKE', "%{$searchTerm}%")
+                ->orWhere('lastName', 'LIKE', "%{$searchTerm}%")
+                ->orWhere('sponsor', 'LIKE', "%{$searchTerm}%")
+                ->orWhere('package', 'LIKE', "%{$searchTerm}%")
+                ->orWhere('rank', 'LIKE', "%{$searchTerm}%")
+                ->orWhere('phoneNumber', 'LIKE', "%{$searchTerm}%")
+                ->orWhere('status', 'LIKE', "%{$searchTerm}%")
+                ->orWhere('accountNumber', 'LIKE', "%{$searchTerm}%");
+        });
+    }
+
+    private function refreshManagerCounts(array $managerIds): void
+    {
+        $uniqueManagerIds = collect($managerIds)->filter()->unique();
+
+        if ($uniqueManagerIds->isEmpty()) {
+            return;
+        }
+
+        AccountManager::whereIn('id', $uniqueManagerIds)->get()->each(function (AccountManager $manager) {
+            $count = User::where('manager', $manager->id)->count();
+            $manager->update([
+                'noOfUsers' => $count,
+                'totalUsers' => $count,
+            ]);
+        });
     }
 }
